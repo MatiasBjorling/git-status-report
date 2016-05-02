@@ -1,10 +1,11 @@
 #!/usr/bin/ruby -W0
-require 'Date'
-require 'Time'
+require 'date'
+require 'time'
 require 'rubygems'
 require 'optparse'
-require 'grit'
-include Grit
+require 'rugged'
+
+include Rugged
 
 
 #BEGIN Subroutines
@@ -197,7 +198,7 @@ end
 def initialize_grit_repos (git_repos)
 	git_repos['grit'] = []
 	git_repos['includes'].each do | path |
-		git_repos['grit'].push(Repo.new(path))
+		git_repos['grit'].push(Repository.new(path))
 	end
 end
 
@@ -226,6 +227,7 @@ initialize_grit_repos(@git_repos) #ads grit Repo objects to the @git_repos hash 
 
 
 response_days = []
+response_time = []
 responses_by_day = {}
 	# responses_by_day[date_string][epoch_date] => {branch, repo, commit, subject}
 	# a hash of hashes keyed by iso date
@@ -246,24 +248,24 @@ longest_name = @multiple_people ? 0 : nil
 	# needs to be excluded.
 	
 	# we want all the commits to all branches since option[:days] days ago
-	
-	
-	branches = repo.heads() #an array of Grit::Head objects
-	
+
+	branches = repo.branches() #an array of Grit::Head objects
+
 	branches.each do | branch |
 		if (@options[:branches] and not @options[:branches].include? branch.name)
 			next
 		end
-		branch_commits = repo.commits_since(branch.name, @options[:since] ) #chronological ordering of commits
-		branch_commits.each do | commit | 
-			#puts commit.to_hash().inspect()
-			if ( (@options[:all] or @options[:email].include?(commit.author.email)) and commit.date() >= @options[:since] )
-				# there's currently a bug in grit where commits outside of the specified date range will be returned.
-				# the date check above compensates for that until the patch has been pulled into grit and distributed
-				# widely. - masukomi 7 / 31 / 10
-				if (@multiple_people)
-					longest_name = commit.author.name.length if commit.author.name.length > longest_name
-				end
+
+		walker = Walker.new(repo)
+		walker.sorting(SORT_DATE)
+		walker.push(repo.branches[branch.name].target_id)
+
+		walker.each do | commit |
+			if (commit.author[:time] <= @options[:since])
+				break
+			end
+
+			if ( (@options[:all] or @options[:email].include?(commit.author[:email])) and commit.time() >= @options[:since] )
 				commit_hash = commit.to_hash()
 				response_hash = {
 					'branch'	=> branch,
@@ -272,23 +274,16 @@ longest_name = @multiple_people ? 0 : nil
 					'subject'	=> commit.message.split(/\n/)[0]
 				}
 				#commit.date() is a Time object 2010-07-26T22:46:41-04:00
-				date_string = sprintf "%02d-%02d-%02d" % [commit.date().year, commit.date().month, commit.date().day]
+				date_string = sprintf "%02d-%02d-%02d" % [commit.time().year, commit.time().month, commit.time().day]
 
 				if (not responses_by_day[date_string])
 					responses_by_day[date_string] = {}
 					author_subjects_by_day[date_string] = {}
 					response_days.push(date_string)
+					response_time.push(commit.time())
 				end
-				if (@multiple_people)
-					if (not author_subjects_by_day[date_string][commit.author.email])
-						author_subjects_by_day[date_string][commit.author.email] = {}
-					end
-				end
-				
-				if  ((@multiple_people and not author_subjects_by_day[date_string][commit.author.email][response_hash['subject']]) \
-					or \
-					(not @multiple_people and not author_subjects_by_day[date_string][response_hash['subject']]))
 
+				if  (not author_subjects_by_day[date_string][response_hash['subject']])
 					# using the epoch time of the commit is too unique because it's not 
 					# uncommon to commit on one branch, merge into another branch, and then ammend 
 					# the commit on the merged branch, which gives you the same "work" (as far as the report 
@@ -296,12 +291,8 @@ longest_name = @multiple_people ? 0 : nil
 					
 					# Also, betting on the unlikelyhood of two people commiting at the same second
 					# eventually this will need to be addressed
-					responses_by_day[date_string][commit.date().to_i] = response_hash
-					if ( @multiple_people )
-						author_subjects_by_day[date_string][commit.author.email][response_hash['subject']] = true
-					else
-						author_subjects_by_day[date_string][response_hash['subject']] = true
-					end
+					responses_by_day[date_string][commit.time().to_i] = response_hash
+					author_subjects_by_day[date_string][response_hash['subject']] = true
 				end
 			end
 		end
@@ -312,15 +303,14 @@ days=['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturda
 
 puts "Status report for #{@options[:all] ? 'All contributors' : @options[:email].join(', ')} (last #{@options[:days]} days)"
 
-
 if (response_days.length > 0)
 	response_days.sort!
 	if (@options[:reverse])
 		response_days.reverse!
 	end
 	response_days.each do | date |
-		
-		puts date if not @options[:simple]
+
+		puts "%s %s" % [date, Date::DAYNAMES[Date.parse(date, '%Y-%m-%d').wday]] if not @options[:simple]
 		count = nil
 		if (not @options[:reverse])
 			count = (responses_by_day[date].length > 1) ? 1 : ''
@@ -332,14 +322,14 @@ if (response_days.length > 0)
 			epoch_commit_times.reverse!
 		end
 		epoch_commit_times.each do |epoch|
-			commit_info =responses_by_day[date][epoch]
+			commit_info = responses_by_day[date][epoch]
 			commit = commit_info['commit']
 			commit_hash = commit.to_hash()
 			if (not @options[:verbose])
 				if (not (@options[:all] or @multiple_people))
 					puts "\t* #{commit_info['subject']}"
 				else
-					puts "\t* [ %-#{longest_name}s ] %s" % [commit.author.name , commit_info['subject']]
+					puts "\t [ %-#{longest_name}s ] %s" % [commit.author[:name] , commit_info['subject']]
 				end
 			else
 				if (count != '') # a multi-commit day
